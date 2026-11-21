@@ -132,11 +132,40 @@ def render(name: str, s: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    inventory_options = any(arg == "--inventory" or arg.startswith("--inventory=")
+                            or arg == "--inventory-input-kind" or arg.startswith("--inventory-input-kind=")
+                            for arg in sys.argv[1:])
+    if inventory_options:
+        # argparse normally echoes bad arguments and the executable path. Keep
+        # opt-in parse failures sanitized without altering legacy diagnostics.
+        def inventory_parse_error(_message):
+            ap.exit(2, '{"code": "inventory-arguments", "message": "Invalid inventory command arguments."}\n')
+        ap.error = inventory_parse_error
     ap.add_argument("paths", nargs="*")
     ap.add_argument("--hf", nargs=3, metavar=("REPO", "REV", "DIR"))
     ap.add_argument("--name")
     ap.add_argument("--json")
+    ap.add_argument("--inventory", action="store_true", help="bounded local header receipt to stdout; no payload")
+    ap.add_argument("--inventory-input-kind", choices=("local-unverified", "synthetic"),
+                    help="inventory-only declaration, not authenticated provenance")
     a = ap.parse_args()
+    if a.inventory:
+        import gguf_inventory as I  # opt-in only; legacy parser/summary/HF paths below are unchanged
+        if a.hf is not None or a.json is not None or a.name is not None:
+            sys.stderr.write(I.diagnostic(I.InventoryError(
+                "inventory-option-conflict", "Inventory is local stdout only; --hf, --json and --name are incompatible.")))
+            return 2
+        try:
+            receipt = I.inventory(a.paths, a.inventory_input_kind or "local-unverified")
+            output = I.dumps(receipt)
+        except I.InventoryError as error:
+            sys.stderr.write(I.diagnostic(error))
+            return 2
+        sys.stdout.write(output)
+        return 3 if receipt["split"]["status"] == "incomplete" else 0
+    if a.inventory_input_kind is not None:
+        sys.stderr.write('{"code": "inventory-option-required", "message": "--inventory-input-kind requires --inventory."}\n')
+        return 2
     if a.hf:
         heads = hf_headers(*a.hf)
         name = a.name or a.hf[2]

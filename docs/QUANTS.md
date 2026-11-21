@@ -30,6 +30,101 @@ window is about 4.8 GB in every file.
 UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 share their shards 2 (the output head) and 3 (the PLE table) byte for byte (the same
 SHA-256), so a PC that has one of them can link those two shards instead of downloading them again.
 
+## Bounded local header inventory (opt-in)
+
+For a machine-readable record of local headers, add `--inventory`. It uses only Python's standard library and the
+existing GGUF reader. It does not download anything, load a tokenizer, start the engine or read tensor payloads.
+The existing local summary, legacy `--json` output and Hugging Face range-request mode stay unchanged.
+
+Run from the source checkout root. Quote a glob so the bounded scanner, not the shell, expands it:
+
+```sh
+python3 -B -E -S terminal/tools/quant_formats.py --inventory '/models/pack/*.gguf'
+python3 -B -E -S terminal/tools/quant_formats.py --inventory /models/part-a.gguf /models/part-b.gguf
+```
+
+Only explicit files and nonrecursive basename globs are accepted. The command does not discover sibling shards
+or infer split numbers from filenames. Directories, symlinks, special files, recursive globs, duplicate files,
+aliases and duplicate basenames are refused. This mode requires POSIX `O_NOFOLLOW` and `O_NONBLOCK`; systems without
+those protections fail closed. `--hf`, `--json` and `--name` cannot be combined with `--inventory`.
+
+The schema-v1 receipt goes to stdout. To save it, redirect to a separate output file that is not an input GGUF.
+The caller's shell can truncate a redirection target before the command runs; the input checks cannot prevent that.
+For files deliberately made by a test, `--inventory-input-kind synthetic` labels the receipt as synthetic. The
+default is `local-unverified`. Either label is a declaration, not verified provenance.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | A valid header receipt with a complete declared split, or no split declarations (`unknown`). |
+| `3` | A valid receipt with missing shards or partial split declarations (`incomplete`); inspect its diagnostics. |
+| `2` | Invalid arguments, malformed headers, unsafe input or an inspection ceiling; stdout is empty. |
+
+Split declarations are the scalar integer metadata keys `split.no`, `split.count` and `split.tensors.count`.
+Available counts and totals must agree. A complete declared set must have every index and exactly its declared
+tensor total. A metadata-only shard is legal, including an unpadded file whose aligned data start is past EOF.
+Architecture metadata on a later shard is not required. A complete split is not proof of a complete or usable model.
+
+Shard labels are generated from sorted unique input basenames as `shard-0000`, `shard-0001`, and so on. Source paths,
+basenames and timestamps are not emitted. Tensor names remain in the receipt; review them before sharing it.
+Tensors are sorted by shard label and name. Shapes keep raw GGUF order: `shape[0]` is the fastest dimension, or
+values per encoded row, not the row/column order used by a CPU matrix kernel.
+
+Known storage is limited to exact type IDs: F32 `0`, F16 `1`, Q8_0 `8`, IQ2_XS `17`, IQ3_S `21`, I8/I16/I32/I64
+`24`/`25`/`26`/`27`, F64 `28`, BF16 `30` and Q2_0 `42`. Their block geometry comes from the existing reader.
+The fastest dimension must contain whole blocks. Other layouts keep nullable block, stride and byte fields with
+`layout: "unknown"`; in particular NVFP4 `40` and type `41` are not confirmed by this inventory. A known-storage
+subtotal excludes unknown tensors, metadata, alignment padding, gaps and runtime conversions. It is not a full
+model-size or memory-budget estimate. Aligned offsets, bounded shape products, known extents and interval overlap
+are checked against the same open file's size; unknown sizes are never guessed.
+
+### What the receipt does not prove
+
+`header_sha256` hashes only the consumed logical range `[0, header_end_bytes)`. It excludes alignment padding and
+tensor payloads. `artifact_sha256` and `tensor_sha256` stay `null`. Only `header_only` is true. Provenance, artifact
+integrity, model completeness, backend compatibility, device readiness and inference readiness stay false, even
+for a complete split with known storage. Producer revision/hash fields identify the reviewed base parser, not an
+authenticated executable or artifact. This receipt is an inspection record, not permission to execute tensor names,
+load a model or program a device.
+
+The adapter opens ordinary local files read-only and unbuffered, and compares device, inode, size, mtime and ctime
+on the same descriptor before and after inspection. It does not mmap, preload or deliberately read padding or
+payload. This is not a sandbox or a race-proof filesystem boundary: parent directories are not confined, the OS
+may read ahead internally, and malicious lengths may describe purported payload as logical header bytes. The
+ceilings below bound requested logical reads and parser work; they are not OS memory/CPU guarantees.
+
+### Fixed inspection ceilings
+
+| Resource | Ceiling |
+|---|---:|
+| Path arguments / matched shards | 64 / 64 |
+| Each UTF-8 path argument | 4,096 bytes |
+| Directory entries scanned across all globs | 4,096 |
+| Logical header bytes per file / all files | 16 MiB / 32 MiB |
+| Each string / string bytes across all files | 1 MiB / 16 MiB |
+| Metadata entries per file / all files | 4,096 / 8,192 |
+| Tensors across all files | 100,000 |
+| Metadata array items per file / all files | 500,000 / 1,000,000 |
+| Tensor rank | 1–8 |
+| Alignment | Power of two, 8–1,048,576 bytes |
+| Dimensions, shape products, byte arithmetic and file size | At most `(1 << 63) - 1` |
+| Generated JSON receipt | 64 MiB |
+
+Counts and minimum byte requirements are checked before loops and unpack allocations, including the tensor count
+before the first metadata entry. Strings require strict UTF-8; tensor names and metadata keys must be nonempty
+and free of control/format/surrogate characters. Duplicate metadata keys and tensor names, nonfinite floats,
+nested arrays and malformed declarations are refused. These are inspection limits, not supported model or
+hardware limits. A separate receipt consumer should also cap JSON nesting and number-literal length.
+
+Synthetic-only tests cover these guards and literal byte regressions for the old default, local JSON and mocked
+Hugging Face requests. They need no model, third-party packages or hardware:
+
+```sh
+python3 -B -E -S -m unittest discover -s terminal/tools -p 'test_gguf*.py' -v
+```
+
+The new CI job runs only on pushes to `bounded-gguf-inventory` in the `lvyufeng/Strata` fork. It uses already-cached
+Python 3.11 and 3.14 and fails if either cache is absent; it does not install tools or build the engine.
+
 ## Kernels per format and backend
 
 | Format (role) | CUDA decode (grouped experts) | CUDA prompt | CPU pool | AMD (HIP) decode | AMD prompt | Intel (SYCL) decode | Intel prompt |

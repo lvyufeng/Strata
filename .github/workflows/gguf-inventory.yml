@@ -1,0 +1,60 @@
+# Copyright (c) 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
+name: Bounded GGUF header inventory
+
+on:
+  push:
+    branches:
+      - bounded-gguf-inventory
+    paths:
+      - 'terminal/tools/gguf_inventory.py'
+      - 'terminal/tools/quant_formats.py'
+      - 'terminal/tools/gguf_reader.py'
+      - 'terminal/tools/test_gguf*.py'
+      - 'docs/QUANTS.md'
+      - '.github/workflows/gguf-inventory.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-inventory:
+    if: github.repository == 'lvyufeng/Strata' && github.ref == 'refs/heads/bounded-gguf-inventory' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Locate cached Python only
+        id: cached_python
+        shell: bash
+        env:
+          PYTHON_MINOR: ${{ matrix.python }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          selected=''
+          for candidate in "${RUNNER_TOOL_CACHE:?}/Python/${PYTHON_MINOR}."*/x64/bin/python; do
+            if [[ -x "$candidate" ]]; then
+              selected="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$selected" ]]; then
+            printf 'Cached Python %s unavailable; no installation or download allowed.\n' "$PYTHON_MINOR" >&2
+            exit 1
+          fi
+          "$selected" -B -E -S -c 'import os, sys; assert sys.version_info[:2] == tuple(map(int, os.environ["PYTHON_MINOR"].split("."))); print(sys.version)'
+          printf 'executable=%s\n' "$selected" >> "${GITHUB_OUTPUT:?}"
+      - name: Run stdlib synthetic and legacy GGUF tests
+        shell: bash
+        env:
+          CACHED_PYTHON: ${{ steps.cached_python.outputs.executable }}
+        run: |
+          set -euo pipefail
+          "$CACHED_PYTHON" -B -E -S -m unittest discover -s terminal/tools -p 'test_gguf*.py' -v
