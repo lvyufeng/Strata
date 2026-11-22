@@ -134,6 +134,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     inventory_options = any(arg == "--inventory" or arg.startswith("--inventory=")
                             or arg == "--inventory-input-kind" or arg.startswith("--inventory-input-kind=")
+                            or arg == "--inventory-schema-version" or arg.startswith("--inventory-schema-version=")
                             for arg in sys.argv[1:])
     if inventory_options:
         # argparse normally echoes bad arguments and the executable path. Keep
@@ -148,6 +149,8 @@ def main() -> int:
     ap.add_argument("--inventory", action="store_true", help="bounded local header receipt to stdout; no payload")
     ap.add_argument("--inventory-input-kind", choices=("local-unverified", "synthetic"),
                     help="inventory-only declaration, not authenticated provenance")
+    ap.add_argument("--inventory-schema-version", type=int, choices=(1, 2), default=None,
+                    help="inventory receipt profile; 1 is the reviewed default, 2 is opt-in")
     a = ap.parse_args()
     if a.inventory:
         import gguf_inventory as I  # opt-in only; legacy parser/summary/HF paths below are unchanged
@@ -156,15 +159,17 @@ def main() -> int:
                 "inventory-option-conflict", "Inventory is local stdout only; --hf, --json and --name are incompatible.")))
             return 2
         try:
-            receipt = I.inventory(a.paths, a.inventory_input_kind or "local-unverified")
+            schema_version = (I.DEFAULT_SCHEMA_VERSION if a.inventory_schema_version is None
+                              else a.inventory_schema_version)
+            receipt = I.inventory(a.paths, a.inventory_input_kind or "local-unverified", schema_version)
             output = I.dumps(receipt)
         except I.InventoryError as error:
             sys.stderr.write(I.diagnostic(error))
             return 2
         sys.stdout.write(output)
         return 3 if receipt["split"]["status"] == "incomplete" else 0
-    if a.inventory_input_kind is not None:
-        sys.stderr.write('{"code": "inventory-option-required", "message": "--inventory-input-kind requires --inventory."}\n')
+    if a.inventory_input_kind is not None or a.inventory_schema_version is not None:
+        sys.stderr.write('{"code": "inventory-option-required", "message": "--inventory-input-kind and --inventory-schema-version require --inventory."}\n')
         return 2
     if a.hf:
         heads = hf_headers(*a.hf)

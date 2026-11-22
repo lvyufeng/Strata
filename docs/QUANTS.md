@@ -48,9 +48,19 @@ or infer split numbers from filenames. Directories, symlinks, special files, rec
 aliases and duplicate basenames are refused. This mode requires POSIX `O_NOFOLLOW` and `O_NONBLOCK`; systems without
 those protections fail closed. `--hf`, `--json` and `--name` cannot be combined with `--inventory`.
 
-The versioned receipt goes to stdout; this revision emits `schema_version: 2` with producer mode `bounded-local-v2`.
-Receipts from the earlier revision carry `schema_version: 1` and stay valid input for the integration checker, which
-dispatches on the declared version and never coerces one into the other. To save a receipt, redirect to a separate output file that is not an input GGUF.
+The versioned receipt goes to stdout. The default stays the reviewed `schema_version: 1` surface with producer mode
+`bounded-local-v1`, byte-identical to the earlier revision. The newer profile is opt-in per run:
+
+```sh
+python3 -B -E -S terminal/tools/quant_formats.py --inventory --inventory-schema-version 2 /models/part-a.gguf /models/part-b.gguf
+```
+
+That emits `schema_version: 2` with producer mode `bounded-local-v2`. It raises only the two metadata-array-item
+ceilings — the real IQ2_XS first shard declares 744,317 items in one file, above the v1 per-file 500,000 — and
+confirms six more GGML type ids that the same header declares. Every other ceiling and all twelve v1 type ids are
+unchanged; IQ1_S (19), MXFP4 (39), NVFP4 (40) and the ambiguous id 41 stay unknown. Both receipt versions are valid
+input for the integration checker, which dispatches on the declared version and never coerces one into the other.
+To save a receipt, redirect to a separate output file that is not an input GGUF.
 The caller's shell can truncate a redirection target before the command runs; the input checks cannot prevent that.
 For files deliberately made by a test, `--inventory-input-kind synthetic` labels the receipt as synthetic. The
 default is `local-unverified`. Either label is a declaration, not verified provenance.

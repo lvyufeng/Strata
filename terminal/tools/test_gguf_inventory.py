@@ -371,21 +371,75 @@ class LocalInventoryTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
         self.assertNotIn(str(self.root), str(caught.exception))
 
+    def test_default_profile_is_the_reviewed_v1_surface(self):
+        # A new profile is opt-in: an unqualified run keeps the last accepted v1
+        # receipt surface, and both profiles stay reachable in the same process.
+        self.assertEqual(I.DEFAULT_SCHEMA_VERSION, 1)
+        self.assertEqual(set(I.PROFILES), {1, 2})
+        for alias, key in (("LIMITS", "limits"), ("PRODUCER", "producer"),
+                           ("CONFIRMED_TYPE_IDS", "confirmed_type_ids")):
+            with self.subTest(alias=alias):
+                self.assertEqual(getattr(I, alias), I.PROFILES[1][key])
+        self.assertEqual(I.LIMITS, V1_LIMITS)
+        self.assertEqual(I.PRODUCER["mode"], "bounded-local-v1")
+        self.assertEqual(I.PRODUCER["base_revision"], "3142b66b96e9c0e775e30f620b11b191a1427c2a")
+        # The producer claim must describe the parser actually shipped here, not a
+        # stale digest: pin the claim to the parser bytes on disk.
+        self.assertEqual(I.PRODUCER["parser_sha256"],
+                         hashlib.sha256((TOOLS / "gguf_reader.py").read_bytes()).hexdigest())
+        self.assertEqual(I.CONFIRMED_TYPE_IDS, I.PROFILES[1]["confirmed_type_ids"])
+
     def test_v2_raises_only_the_two_array_item_ceilings(self):
-        self.assertEqual(I.SCHEMA_VERSION, 2)
-        self.assertEqual(I.PRODUCER["mode"], "bounded-local-v2")
-        self.assertEqual(set(I.LIMITS), set(V1_LIMITS))
-        for key, value in I.LIMITS.items():
+        self.assertEqual(I.PROFILES[2]["producer"]["mode"], "bounded-local-v2")
+        self.assertEqual(I.PROFILES[2]["producer"]["parser_sha256"], I.PRODUCER["parser_sha256"])
+        self.assertEqual(I.PROFILES[2]["producer"]["base_revision"], I.PRODUCER["base_revision"])
+        self.assertEqual(set(I.PROFILES[2]["limits"]), set(V1_LIMITS))
+        for key, value in I.PROFILES[2]["limits"].items():
             with self.subTest(limit=key):
                 self.assertEqual(value, V2_RAISED.get(key, V1_LIMITS[key]))
+        for key in ("max_array_items_per_file", "max_array_items_total"):
+            with self.subTest(raised=key):
+                self.assertLess(I.PROFILES[1]["limits"][key], I.PROFILES[2]["limits"][key])
 
-    def test_v2_receipt_echoes_declared_profile(self):
+    def test_v2_confirms_only_six_additional_ids(self):
+        v1, v2 = I.PROFILES[1]["confirmed_type_ids"], I.PROFILES[2]["confirmed_type_ids"]
+        self.assertEqual(v2 - v1, {14, 16, 20, 22, 23, 29})
+        self.assertEqual(v1 - v2, set())
+        for unknown in (19, 39, 40, 41):
+            with self.subTest(type_id=unknown):
+                self.assertNotIn(unknown, v2)
+
+    def test_default_receipt_bytes_match_the_base_revision_baseline(self):
+        # Captured from the clean reviewed base (1c6f950) exporter over the same
+        # fixture, before this change: the default profile must not move v1 receipt
+        # bytes. A pin fails on any drift in limits, producer, ordering or geometry
+        # instead of quietly re-freezing a freshly generated receipt.
         path, _, _ = self.write_fixture()
-        doc = I.inventory([str(path)])
-        self.assertEqual(doc["schema_version"], 2)
-        self.assertEqual(doc["producer"], I.PRODUCER)
-        self.assertEqual(doc["limits"], I.LIMITS)
-        self.assertEqual(doc["claims"], I.CLAIMS)
+        output = I.dumps(I.inventory([str(path)])).encode()
+        self.assertEqual(hashlib.sha256(output).hexdigest(),
+                         "9bc246f626e2a5ff29b314eedc33d8f78dad63e2c73442667ef6974a98a32b80")
+
+    def test_receipt_echoes_the_selected_profile_in_either_order(self):
+        path, _, _ = self.write_fixture()
+        v2 = I.inventory([str(path)], schema_version=2)
+        v1 = I.inventory([str(path)])
+        self.assertEqual((v1["schema_version"], v2["schema_version"]), (1, 2))
+        self.assertEqual(v1["producer"], I.PROFILES[1]["producer"])
+        self.assertEqual(v2["producer"], I.PROFILES[2]["producer"])
+        self.assertEqual(v1["limits"], I.PROFILES[1]["limits"])
+        self.assertEqual(v2["limits"], I.PROFILES[2]["limits"])
+        self.assertEqual(v1["claims"], I.CLAIMS)
+        self.assertEqual(I.inventory([str(path)]), v1)
+
+    def test_unreviewed_schema_versions_are_rejected_before_inspection(self):
+        path, _, _ = self.write_fixture()
+        for version in (0, 3, True, "2", 1.0, None):
+            with self.subTest(version=version):
+                with self.assertRaises(I.InventoryError) as caught:
+                    I.inventory([str(path)], schema_version=version)
+                self.assertEqual(caught.exception.code, "schema-version")
+                self.assertNotIn(str(self.root), caught.exception.message)
+        self.assertEqual(I.inventory([str(path)], schema_version=1)["schema_version"], 1)
 
     def test_v2_confirms_the_six_additional_measured_block_types(self):
         # Literal geometry, not expected_bytes(): exact block bytes for the IDs the
@@ -395,7 +449,7 @@ class LocalInventoryTests(unittest.TestCase):
         specs = [(name.lower(), [block, 2], kind, number * 1024)
                  for number, (kind, name, block, _) in enumerate(cases)]
         path, _, _ = self.write_fixture(tensors=specs, payload_size=8192)
-        doc = I.inventory([str(path)])
+        doc = I.inventory([str(path)], schema_version=2)
         tensors = {t["ggml_type_id"]: t for t in doc["tensors"]}
         for kind, name, block, size in cases:
             tensor = tensors[kind]
@@ -406,17 +460,20 @@ class LocalInventoryTests(unittest.TestCase):
                          "known_storage_bytes": 2 * sum(case[3] for case in cases),
                          "unknown_storage_tensors": 0})
 
-    def test_v2_keeps_iq1_s_and_mxfp4_unknown(self):
-        path, _, _ = self.write_fixture(tensors=[("iq1s", [256], 19, 0), ("mxfp4", [32], 39, 32)])
-        doc = I.inventory([str(path)])
+    def test_v2_keeps_iq1_s_mxfp4_nvfp4_and_the_ambiguous_id_unknown(self):
+        cases = [(19, "IQ1_S", [256], 0), (39, "MXFP4", [32], 32),
+                 (40, "NVFP4", [64], 0), (41, "Q4_0_8_8", [64], 32),
+                 (147, "TQP5", [128], 64), (999, "type999", [5, 3], 96)]
+        specs = [(name.lower(), shape, kind, offset) for kind, name, shape, offset in cases]
+        path, _, _ = self.write_fixture(tensors=specs, payload_size=256)
+        doc = I.inventory([str(path)], schema_version=2)
         self.assertEqual({t["ggml_type_id"]: t["ggml_type_name"] for t in doc["tensors"]},
-                         {19: "IQ1_S", 39: "MXFP4"})
+                         {kind: name for kind, name, _, _ in cases})
         for tensor in doc["tensors"]:
-            self.assertEqual(tensor["storage"]["layout"], "unknown")
-            self.assertIsNone(tensor["storage"]["block_elements"])
-            self.assertIsNone(tensor["storage"]["data_bytes"])
+            self.assertEqual(tensor["storage"], {"layout": "unknown", "block_elements": None,
+                             "block_bytes": None, "row_stride_bytes": None, "data_bytes": None})
         self.assertEqual(doc["totals"]["known_storage_bytes"], 0)
-        self.assertEqual(doc["totals"]["unknown_storage_tensors"], 2)
+        self.assertEqual(doc["totals"]["unknown_storage_tensors"], len(cases))
 
     def test_measured_shard_array_scale_is_accepted_under_v2_ceiling(self):
         # 744317 is the measured per-file declaration of the actual shard 1 header.
@@ -426,11 +483,14 @@ class LocalInventoryTests(unittest.TestCase):
         self.assertGreater(MEASURED_ARRAY_ITEMS, V1_LIMITS[binding])
         for key in ("max_array_items_per_file", "max_array_items_total"):
             with self.subTest(limit=key):
-                self.assertLess(MEASURED_ARRAY_ITEMS, I.LIMITS[key])
+                self.assertLess(MEASURED_ARRAY_ITEMS, I.PROFILES[2]["limits"][key])
         raw, end = large_array_fixture(MEASURED_ARRAY_ITEMS)
         path = self.root / "arrays.gguf"
         path.write_bytes(raw)
-        doc = I.inventory([str(path)])
+        with self.assertRaises(I.InventoryError) as caught:
+            I.inventory([str(path)])
+        self.assertEqual(caught.exception.code, "array-count-limit")
+        doc = I.inventory([str(path)], schema_version=2)
         self.assertEqual(doc["schema_version"], 2)
         self.assertEqual(doc["shards"][0]["header_end_bytes"], end)
         self.assertEqual(doc["totals"], {"tensor_count": 0, "known_storage_bytes": 0, "unknown_storage_tensors": 0})
@@ -842,6 +902,33 @@ class LocalInventoryTests(unittest.TestCase):
         self.assertEqual(json.loads(stderr)["code"], "inventory-arguments")
         self.assertNotIn(b"private", stderr)
 
+    def test_cli_schema_version_selects_the_profile_and_stays_sanitized(self):
+        path, _, _ = self.write_fixture()
+        for arguments, version, mode in (
+                (["--inventory", str(path)], 1, "bounded-local-v1"),
+                (["--inventory", "--inventory-schema-version", "1", str(path)], 1, "bounded-local-v1"),
+                (["--inventory", "--inventory-schema-version", "2", str(path)], 2, "bounded-local-v2"),
+                (["--inventory", "--inventory-schema-version=2", str(path)], 2, "bounded-local-v2")):
+            with self.subTest(version=version, arguments=arguments):
+                status, stdout, stderr = run_cli(arguments)
+                self.assertEqual((status, stderr), (0, b""))
+                doc = json.loads(stdout)
+                self.assertEqual((doc["schema_version"], doc["producer"]["mode"]), (version, mode))
+                self.assertEqual(doc["limits"], I.PROFILES[version]["limits"])
+        # Unsupported selector values are inventory argument errors, never an
+        # argparse echo that could contain a private path.
+        for value in ("0", "3", "private-value"):
+            with self.subTest(value=value):
+                status, stdout, stderr = run_cli(["--inventory", "--inventory-schema-version", value, str(path)])
+                self.assertEqual((status, stdout), (2, b""))
+                self.assertEqual(json.loads(stderr)["code"], "inventory-arguments")
+                self.assertNotIn(b"private", stderr)
+                self.assertNotIn(str(path).encode(), stderr)
+        # The selector alone is meaningless, exactly like the input-kind flag.
+        status, stdout, stderr = run_cli(["--inventory-schema-version", "2"])
+        self.assertEqual((status, stdout), (2, b""))
+        self.assertEqual(json.loads(stderr)["code"], "inventory-option-required")
+
     def test_receipt_ceiling_fails_before_any_stdout(self):
         path, _, _ = self.write_fixture()
         with mock.patch.object(I, "MAX_RECEIPT_BYTES", 128):
@@ -851,11 +938,14 @@ class LocalInventoryTests(unittest.TestCase):
 
     def test_actual_cli_subprocess_is_stdlib_only(self):
         path, _, _ = self.write_fixture(metadata=declared(0, 2, 0), payload_size=0, pad=False)
-        result = subprocess.run([sys.executable, "-B", "-E", "-S", str(TOOLS / "quant_formats.py"),
-                                 "--inventory", "--inventory-input-kind", "synthetic", str(path)],
-                                capture_output=True, timeout=10, check=False)
-        self.assertEqual((result.returncode, result.stderr), (3, b""))
-        self.assertEqual(json.loads(result.stdout)["split"]["status"], "incomplete")
+        for extra, version in (([], 1), (["--inventory-schema-version", "2"], 2)):
+            with self.subTest(version=version):
+                result = subprocess.run([sys.executable, "-B", "-E", "-S", str(TOOLS / "quant_formats.py"),
+                                         "--inventory", "--inventory-input-kind", "synthetic", *extra, str(path)],
+                                        capture_output=True, timeout=10, check=False)
+                self.assertEqual((result.returncode, result.stderr), (3, b""))
+                self.assertEqual(json.loads(result.stdout)["split"]["status"], "incomplete")
+                self.assertEqual(json.loads(result.stdout)["schema_version"], version)
 
 
 class LegacyByteRegressionTests(unittest.TestCase):

@@ -23,12 +23,14 @@ import gguf_reader as G
 
 MAX_INTEGER = (1 << 63) - 1
 MAX_RECEIPT_BYTES = 64 << 20
-SCHEMA_VERSION = 2
-# v2 raises only the metadata-array-item ceilings, after measuring 744,317
-# declared items in one real shard header, and confirms the six additional GGML
-# types present in that artifact's declared type census. Every other ceiling is
-# unchanged from the reviewed v1 adapter at base revision 3142b66b.
-LIMITS = {
+# v1 is the reviewed profile at base revision 3142b66b. v2 raises only the two
+# metadata-array-item ceilings, after measuring 744,317 declared items in one real
+# shard header, and confirms the six additional GGML types present in that
+# artifact's declared type census. Every other ceiling and all twelve v1 type ids
+# are unchanged. Both profiles stay reachable: inventory(schema_version=...) and
+# quant_formats.py --inventory-schema-version select one; there is no module-global
+# swap, so v1 and v2 can be produced in the same process in either order.
+LIMITS_V1 = {
     "max_shards": 64,
     "max_header_bytes_per_file": 16777216,
     "max_header_bytes_total": 33554432,
@@ -37,18 +39,42 @@ LIMITS = {
     "max_metadata_entries_per_file": 4096,
     "max_metadata_entries_total": 8192,
     "max_tensors_total": 100000,
-    "max_array_items_per_file": 2000000,
-    "max_array_items_total": 4000000,
+    "max_array_items_per_file": 500000,
+    "max_array_items_total": 1000000,
     "max_rank": 8,
     "max_glob_entries": 4096,
     "max_path_arguments": 64,
 }
-PRODUCER = {
+LIMITS_V2 = dict(LIMITS_V1)
+LIMITS_V2.update({"max_array_items_per_file": 2000000, "max_array_items_total": 4000000})
+PARSER_SHA256 = "c84a0f88c6c75a588cb7de74abd23b2e6387c92c58e088012aedef5bd3c6c431"
+PRODUCER_V1 = {
     "tool": "Strata/terminal/tools/quant_formats.py",
-    "mode": "bounded-local-v2",
+    "mode": "bounded-local-v1",
     "base_revision": "3142b66b96e9c0e775e30f620b11b191a1427c2a",
-    "parser_sha256": "c84a0f88c6c75a588cb7de74abd23b2e6387c92c58e088012aedef5bd3c6c431",
+    "parser_sha256": PARSER_SHA256,
 }
+PRODUCER_V2 = dict(PRODUCER_V1, mode="bounded-local-v2")
+# An inventory allowlist, not a replacement ggml type/geometry table. The v2 set
+# adds the six ids that the target artifact declares itself: Q6_K 14, IQ2_XXS 16,
+# IQ4_NL 20, IQ2_S 22, IQ4_XS 23 and IQ1_M 29. In particular, IQ1_S 19, MXFP4 39,
+# NVFP4 40, the ambiguous id 41 and other layouts still stay unknown.
+CONFIRMED_TYPE_IDS_V1 = frozenset((0, 1, 8, 17, 21, 24, 25, 26, 27, 28, 30, 42))
+CONFIRMED_TYPE_IDS_V2 = frozenset(CONFIRMED_TYPE_IDS_V1 | {14, 16, 20, 22, 23, 29})
+PROFILES = {
+    1: {"limits": LIMITS_V1, "producer": PRODUCER_V1,
+        "confirmed_type_ids": CONFIRMED_TYPE_IDS_V1},
+    2: {"limits": LIMITS_V2, "producer": PRODUCER_V2,
+        "confirmed_type_ids": CONFIRMED_TYPE_IDS_V2},
+}
+# New schema profiles are opt-in: the default stays the last accepted v1 surface
+# (byte-identical receipts for the same inputs), and schema version 2 is selected
+# explicitly per run. The no-input legacy CLI path never imports this module, so
+# it is unaffected either way.
+DEFAULT_SCHEMA_VERSION = 1
+LIMITS = LIMITS_V1
+PRODUCER = PRODUCER_V1
+CONFIRMED_TYPE_IDS = CONFIRMED_TYPE_IDS_V1
 CLAIMS = {
     "header_only": True,
     "input_provenance_verified": False,
@@ -58,11 +84,6 @@ CLAIMS = {
     "device_ready": False,
     "inference_ready": False,
 }
-# An inventory allowlist, not a replacement ggml type/geometry table. The v2 set
-# adds the six ids that the target artifact declares itself: Q6_K 14, IQ2_XXS 16,
-# IQ4_NL 20, IQ2_S 22, IQ4_XS 23 and IQ1_M 29. In particular, IQ1_S 19, MXFP4 39,
-# NVFP4 40, the ambiguous id 41 and other layouts still stay unknown.
-CONFIRMED_TYPE_IDS = frozenset((0, 1, 8, 14, 16, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 42))
 SPLIT_KEYS = ("split.no", "split.count", "split.tensors.count")
 
 
@@ -96,7 +117,8 @@ def _multiply(a: int, b: int) -> int:
 
 
 class _Budget:
-    def __init__(self):
+    def __init__(self, limits=None):
+        self.limits = LIMITS if limits is None else limits
         self.header_bytes = 0
         self.string_bytes = 0
         self.metadata_entries = 0
@@ -126,6 +148,7 @@ class BoundedHeader(G.GGUFFile):
         self.version, self.alignment = 0, 32
         self._size, self._pos = size, 0
         self._budget = budget
+        self._limits = budget.limits
         self._header_hash = hashlib.sha256()
         self._array_items = 0
         self._value_depth = 0
@@ -141,8 +164,8 @@ class BoundedHeader(G.GGUFFile):
         self.header_sha256 = self._header_hash.hexdigest()
 
     def _read(self, fh, n: int) -> bytes:
-        if (n < 0 or n > LIMITS["max_header_bytes_per_file"] - self._pos
-                or n > LIMITS["max_header_bytes_total"] - self._budget.header_bytes):
+        if (n < 0 or n > self._limits["max_header_bytes_per_file"] - self._pos
+                or n > self._limits["max_header_bytes_total"] - self._budget.header_bytes):
             _reject("header-byte-limit", "Logical header reads exceed an inspection ceiling.")
         raw = super()._read(fh, n)
         self._budget.header_bytes += len(raw)
@@ -156,35 +179,35 @@ class BoundedHeader(G.GGUFFile):
             # Guard both top-level declarations before the first metadata loop,
             # even if the tensor count would otherwise be checked much later.
             _, tensors, metadata = values
-            if tensors > LIMITS["max_tensors_total"] - self._budget.tensors:
+            if tensors > self._limits["max_tensors_total"] - self._budget.tensors:
                 _reject("tensor-count-limit", "Declared tensors exceed the inspection ceiling.")
-            if (metadata > LIMITS["max_metadata_entries_per_file"]
-                    or metadata > LIMITS["max_metadata_entries_total"] - self._budget.metadata_entries):
+            if (metadata > self._limits["max_metadata_entries_per_file"]
+                    or metadata > self._limits["max_metadata_entries_total"] - self._budget.metadata_entries):
                 _reject("metadata-count-limit", "Declared metadata exceeds an inspection ceiling.")
         return values
 
     def _count(self, fh, count: int, min_bytes: int, what: str) -> int:
         if what == "metadata entries":
-            if (count > LIMITS["max_metadata_entries_per_file"]
-                    or count > LIMITS["max_metadata_entries_total"] - self._budget.metadata_entries):
+            if (count > self._limits["max_metadata_entries_per_file"]
+                    or count > self._limits["max_metadata_entries_total"] - self._budget.metadata_entries):
                 _reject("metadata-count-limit", "Declared metadata exceeds an inspection ceiling.")
             self._text_kind = "metadata-key"
         elif what == "tensors":
-            if count > LIMITS["max_tensors_total"] - self._budget.tensors:
+            if count > self._limits["max_tensors_total"] - self._budget.tensors:
                 _reject("tensor-count-limit", "Declared tensors exceed the inspection ceiling.")
             self._text_kind = "tensor-name"
         elif what == "dimensions":
-            if not 1 <= count <= LIMITS["max_rank"]:
+            if not 1 <= count <= self._limits["max_rank"]:
                 _reject("tensor-rank", "Tensor rank must be between one and the inspection ceiling.")
         elif what in ("array strings", "array elements"):
-            if (count > LIMITS["max_array_items_per_file"] - self._array_items
-                    or count > LIMITS["max_array_items_total"] - self._budget.array_items):
+            if (count > self._limits["max_array_items_per_file"] - self._array_items
+                    or count > self._limits["max_array_items_total"] - self._budget.array_items):
                 _reject("array-count-limit", "Metadata arrays exceed an inspection ceiling.")
         # Reject an impossible bounded minimum before base-parser loops or format
         # strings. File-size bounds alone would permit very large allocations.
         needed = count * min_bytes
-        if (needed > LIMITS["max_header_bytes_per_file"] - self._pos
-                or needed > LIMITS["max_header_bytes_total"] - self._budget.header_bytes):
+        if (needed > self._limits["max_header_bytes_per_file"] - self._pos
+                or needed > self._limits["max_header_bytes_total"] - self._budget.header_bytes):
             _reject("header-byte-limit", "Declared entries cannot fit in the bounded logical header.")
         result = super()._count(fh, count, min_bytes, what)
         if what == "metadata entries":
@@ -198,8 +221,8 @@ class BoundedHeader(G.GGUFFile):
 
     def _str(self, fh) -> str:
         (size,) = self._unpack(fh, "<Q")
-        if (size > LIMITS["max_string_bytes"]
-                or size > LIMITS["max_string_bytes_total"] - self._budget.string_bytes):
+        if (size > self._limits["max_string_bytes"]
+                or size > self._limits["max_string_bytes_total"] - self._budget.string_bytes):
             _reject("string-byte-limit", "A string exceeds an inspection ceiling.")
         raw = self._read(fh, size)
         self._budget.string_bytes += size
@@ -234,10 +257,10 @@ class BoundedHeader(G.GGUFFile):
         return value
 
 
-def _expand_paths(arguments) -> list[Path]:
+def _expand_paths(arguments, limits: dict) -> list[Path]:
     if not isinstance(arguments, (list, tuple)) or not arguments:
         _reject("no-inputs", "Provide explicit local files or nonrecursive basename globs.")
-    if len(arguments) > LIMITS["max_path_arguments"]:
+    if len(arguments) > limits["max_path_arguments"]:
         _reject("path-argument-limit", "Path arguments exceed the inspection ceiling.")
     paths, seen_paths, seen_names = [], set(), set()
     scanned = 0
@@ -248,7 +271,7 @@ def _expand_paths(arguments) -> list[Path]:
             _reject("duplicate-input", "Each local input may be provided only once.")
         if path.name in seen_names:
             _reject("duplicate-basename", "Input basenames must be unique for stable shard labels.")
-        if len(paths) >= LIMITS["max_shards"]:
+        if len(paths) >= limits["max_shards"]:
             _reject("shard-count-limit", "Matched shards exceed the inspection ceiling.")
         seen_paths.add(identity)
         seen_names.add(path.name)
@@ -274,7 +297,7 @@ def _expand_paths(arguments) -> list[Path]:
             with os.scandir(path.parent) as entries:
                 for entry in entries:
                     scanned += 1
-                    if scanned > LIMITS["max_glob_entries"]:
+                    if scanned > limits["max_glob_entries"]:
                         _reject("glob-entry-limit", "Directory scans exceed the aggregate inspection ceiling.")
                     if fnmatch.fnmatchcase(entry.name, path.name):
                         matches += 1
@@ -290,21 +313,21 @@ def _snapshot(info) -> tuple:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _split_values(metadata: dict) -> dict:
+def _split_values(metadata: dict, limits: dict) -> dict:
     result = dict(zip(("index", "count", "total_tensors"), (metadata.get(k) for k in SPLIT_KEYS)))
     index, count, total = result.values()
-    if index is not None and (type(index) is not int or not 0 <= index < LIMITS["max_shards"]):
+    if index is not None and (type(index) is not int or not 0 <= index < limits["max_shards"]):
         _reject("split-index", "Split indices must fit the inspection ceiling.")
-    if count is not None and (type(count) is not int or not 1 <= count <= LIMITS["max_shards"]):
+    if count is not None and (type(count) is not int or not 1 <= count <= limits["max_shards"]):
         _reject("split-count", "Split shard counts must be positive and bounded.")
-    if total is not None and (type(total) is not int or not 0 <= total <= LIMITS["max_tensors_total"]):
+    if total is not None and (type(total) is not int or not 0 <= total <= limits["max_tensors_total"]):
         _reject("split-total", "Split tensor totals must be nonnegative and bounded.")
     if index is not None and count is not None and index >= count:
         _reject("split-index", "A split index must be less than its declared shard count.")
     return result
 
 
-def _tensor_receipts(header: BoundedHeader, label: str, size: int) -> list[dict]:
+def _tensor_receipts(header: BoundedHeader, label: str, size: int, confirmed: frozenset) -> list[dict]:
     if header.tensors and header.data_start > size:
         _reject("data-region", "A nonempty tensor directory needs a data region within the file.")
     if header.data_start > MAX_INTEGER:
@@ -327,7 +350,7 @@ def _tensor_receipts(header: BoundedHeader, label: str, size: int) -> list[dict]
             _reject("tensor-offset", "Tensor offsets must point inside the local file data region.")
         storage = {"layout": "unknown", "block_elements": None, "block_bytes": None,
                    "row_stride_bytes": None, "data_bytes": None}
-        if tensor.type_id in CONFIRMED_TYPE_IDS:
+        if tensor.type_id in confirmed:
             block_elements, block_bytes = G.BLOCK_GEOMETRY[tensor.type_name]
             if tensor.shape[0] % block_elements:
                 _reject("row-divisibility", "The fastest tensor dimension must contain whole confirmed blocks.")
@@ -361,7 +384,7 @@ def _tensor_receipts(header: BoundedHeader, label: str, size: int) -> list[dict]
     return tensors
 
 
-def _read_shard(path: Path, label: str, budget: _Budget, identities: set) -> tuple[dict, list[dict]]:
+def _read_shard(path: Path, label: str, budget: _Budget, identities: set, confirmed: frozenset) -> tuple[dict, list[dict]]:
     flags = (getattr(os, "O_NOFOLLOW", None), getattr(os, "O_NONBLOCK", None))
     if os.name != "posix" or any(flag is None for flag in flags):
         _reject("file-safety-unavailable", "This mode requires POSIX no-follow and nonblocking file opens.")
@@ -386,8 +409,8 @@ def _read_shard(path: Path, label: str, budget: _Budget, identities: set) -> tup
                 _reject("duplicate-input", "Local input aliases must not refer to the same file.")
             identities.add(identity)
             header = BoundedHeader(handle, before.st_size, budget)
-            tensors = _tensor_receipts(header, label, before.st_size)
-            split = _split_values(header.metadata)
+            tensors = _tensor_receipts(header, label, before.st_size, confirmed)
+            split = _split_values(header.metadata, budget.limits)
             after = os.fstat(handle.fileno())
             if _snapshot(before) != _snapshot(after):
                 _reject("input-changed", "A local input changed during read-only inspection.")
@@ -438,17 +461,22 @@ def _split_receipt(shards: list[dict], tensor_count: int) -> dict:
     return receipt
 
 
-def inventory(arguments, input_kind: str = "local-unverified") -> dict:
+def inventory(arguments, input_kind: str = "local-unverified",
+              schema_version: int = DEFAULT_SCHEMA_VERSION) -> dict:
     """Inspect only explicitly supplied local shards; no filename split inference."""
+    if type(schema_version) is not int or schema_version not in PROFILES:
+        _reject("schema-version", "Schema version must name a reviewed inventory profile.")
+    profile = PROFILES[schema_version]
     if input_kind not in ("synthetic", "local-unverified"):
         _reject("input-kind", "Input kind must be synthetic or local-unverified.")
-    paths = _expand_paths(arguments)
+    paths = _expand_paths(arguments, profile["limits"])
     shards, tensors, identities, names = [], [], set(), set()
-    budget = _Budget()
+    budget = _Budget(profile["limits"])
     known_bytes, unknown_count = 0, 0
     for number, path in enumerate(paths):
         label = f"shard-{number:04d}"
-        shard, shard_tensors = _read_shard(path, label, budget, identities)
+        shard, shard_tensors = _read_shard(path, label, budget, identities,
+                                           profile["confirmed_type_ids"])
         shards.append(shard)
         for tensor in shard_tensors:
             if tensor["name"] in names:
@@ -462,8 +490,9 @@ def inventory(arguments, input_kind: str = "local-unverified") -> dict:
             tensors.append(tensor)
     tensors.sort(key=lambda t: (t["shard"], t["name"]))
     return {
-        "schema_version": SCHEMA_VERSION, "kind": "gguf-header-inventory", "input_kind": input_kind,
-        "producer": dict(PRODUCER), "limits": dict(LIMITS), "shards": shards, "tensors": tensors,
+        "schema_version": schema_version, "kind": "gguf-header-inventory", "input_kind": input_kind,
+        "producer": dict(profile["producer"]), "limits": dict(profile["limits"]),
+        "shards": shards, "tensors": tensors,
         "split": _split_receipt(shards, len(tensors)),
         "totals": {"tensor_count": len(tensors), "known_storage_bytes": known_bytes,
                    "unknown_storage_tensors": unknown_count},
