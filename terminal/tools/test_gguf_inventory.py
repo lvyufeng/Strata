@@ -37,6 +37,24 @@ BASE_SPECS = [
     ("blk.0.ffn_down_exps.weight", [32, 2], 8, 448),
     ("token_embd.weight", [4, 2], 0, 544),
 ]
+# Reviewed v1 ceilings, captured from the clean base before the v2 profile. The
+# only intended movements are V2_RAISED; every other value is asserted equal.
+V1_LIMITS = {
+    "max_shards": 64,
+    "max_header_bytes_per_file": 16777216,
+    "max_header_bytes_total": 33554432,
+    "max_string_bytes": 1048576,
+    "max_string_bytes_total": 16777216,
+    "max_metadata_entries_per_file": 4096,
+    "max_metadata_entries_total": 8192,
+    "max_tensors_total": 100000,
+    "max_array_items_per_file": 500000,
+    "max_array_items_total": 1000000,
+    "max_rank": 8,
+    "max_glob_entries": 4096,
+    "max_path_arguments": 64,
+}
+V2_RAISED = {"max_array_items_per_file": 2000000, "max_array_items_total": 4000000}
 BASE_STDOUT = b"""### frozen-baseline
 
 | Role | Format | Layers | Tensors | GiB |
@@ -113,6 +131,11 @@ BASE_JSON = b"""{
 }"""
 EMPTY_STDOUT = b"### ?\n\n| Role | Format | Layers | Tensors | GiB |\n|---|---|---|---:|---:|\n\nRouted experts: 0.0 GiB.\n\n| Routed gate / up / down | Layers |\n|---|---|\n"
 
+# Measured on the authorised separate host, header only: shard 1 declares 744317
+# metadata array items (tokens 248320, token_type 248320, merges 247587, plus
+# small arrays). This is a fixture fact, not an artifact or a runtime figure.
+MEASURED_ARRAY_ITEMS = 744317
+
 
 def wire_string(value):
     raw = value if isinstance(value, bytes) else value.encode("utf-8")
@@ -140,6 +163,14 @@ def fixture(tensors=(), metadata=(), *, alignment=32, payload_size=512, pad=True
         header += wire_string(name) + struct.pack("<I", len(shape))
         header += struct.pack("<" + "Q" * len(shape), *shape) + struct.pack("<IQ", type_id, offset)
     raw = header + (b"\0" * (-len(header) % alignment) if pad else b"") + b"\xa5" * payload_size
+    return raw, len(header)
+
+
+def large_array_fixture(count, *, alignment=32, payload_size=64):
+    """A one-u8-array header; items are written as bytes so the test stays small."""
+    header = struct.pack("<IIQQ", 0x46554747, 3, 0, 1) + wire_string("array")
+    header += struct.pack("<IIQ", 9, 0, count) + b"\x01" * count
+    raw = header + b"\0" * (-len(header) % alignment) + b"\xa5" * payload_size
     return raw, len(header)
 
 
@@ -339,6 +370,70 @@ class LocalInventoryTests(unittest.TestCase):
             I.inventory([str(p) for p in paths])
         self.assertEqual(caught.exception.code, code)
         self.assertNotIn(str(self.root), str(caught.exception))
+
+    def test_v2_raises_only_the_two_array_item_ceilings(self):
+        self.assertEqual(I.SCHEMA_VERSION, 2)
+        self.assertEqual(I.PRODUCER["mode"], "bounded-local-v2")
+        self.assertEqual(set(I.LIMITS), set(V1_LIMITS))
+        for key, value in I.LIMITS.items():
+            with self.subTest(limit=key):
+                self.assertEqual(value, V2_RAISED.get(key, V1_LIMITS[key]))
+
+    def test_v2_receipt_echoes_declared_profile(self):
+        path, _, _ = self.write_fixture()
+        doc = I.inventory([str(path)])
+        self.assertEqual(doc["schema_version"], 2)
+        self.assertEqual(doc["producer"], I.PRODUCER)
+        self.assertEqual(doc["limits"], I.LIMITS)
+        self.assertEqual(doc["claims"], I.CLAIMS)
+
+    def test_v2_confirms_the_six_additional_measured_block_types(self):
+        # Literal geometry, not expected_bytes(): exact block bytes for the IDs the
+        # authorised shard pair declares. Unknowns are covered by the next test.
+        cases = [(14, "Q6_K", 256, 210), (16, "IQ2_XXS", 256, 66), (20, "IQ4_NL", 32, 18),
+                 (22, "IQ2_S", 256, 82), (23, "IQ4_XS", 256, 136), (29, "IQ1_M", 256, 56)]
+        specs = [(name.lower(), [block, 2], kind, number * 1024)
+                 for number, (kind, name, block, _) in enumerate(cases)]
+        path, _, _ = self.write_fixture(tensors=specs, payload_size=8192)
+        doc = I.inventory([str(path)])
+        tensors = {t["ggml_type_id"]: t for t in doc["tensors"]}
+        for kind, name, block, size in cases:
+            tensor = tensors[kind]
+            self.assertEqual(tensor["ggml_type_name"], name)
+            self.assertEqual(tensor["storage"], {"layout": "gguf-row-blocks", "block_elements": block,
+                             "block_bytes": size, "row_stride_bytes": size, "data_bytes": 2 * size})
+        self.assertEqual(doc["totals"], {"tensor_count": len(cases),
+                         "known_storage_bytes": 2 * sum(case[3] for case in cases),
+                         "unknown_storage_tensors": 0})
+
+    def test_v2_keeps_iq1_s_and_mxfp4_unknown(self):
+        path, _, _ = self.write_fixture(tensors=[("iq1s", [256], 19, 0), ("mxfp4", [32], 39, 32)])
+        doc = I.inventory([str(path)])
+        self.assertEqual({t["ggml_type_id"]: t["ggml_type_name"] for t in doc["tensors"]},
+                         {19: "IQ1_S", 39: "MXFP4"})
+        for tensor in doc["tensors"]:
+            self.assertEqual(tensor["storage"]["layout"], "unknown")
+            self.assertIsNone(tensor["storage"]["block_elements"])
+            self.assertIsNone(tensor["storage"]["data_bytes"])
+        self.assertEqual(doc["totals"]["known_storage_bytes"], 0)
+        self.assertEqual(doc["totals"]["unknown_storage_tensors"], 2)
+
+    def test_measured_shard_array_scale_is_accepted_under_v2_ceiling(self):
+        # 744317 is the measured per-file declaration of the actual shard 1 header.
+        # v1 rejected it at the 500000 per-file ceiling before reading any item; the
+        # 1000000 total ceiling was not the binding limit (shard 2 declares no arrays).
+        binding = "max_array_items_per_file"
+        self.assertGreater(MEASURED_ARRAY_ITEMS, V1_LIMITS[binding])
+        for key in ("max_array_items_per_file", "max_array_items_total"):
+            with self.subTest(limit=key):
+                self.assertLess(MEASURED_ARRAY_ITEMS, I.LIMITS[key])
+        raw, end = large_array_fixture(MEASURED_ARRAY_ITEMS)
+        path = self.root / "arrays.gguf"
+        path.write_bytes(raw)
+        doc = I.inventory([str(path)])
+        self.assertEqual(doc["schema_version"], 2)
+        self.assertEqual(doc["shards"][0]["header_end_bytes"], end)
+        self.assertEqual(doc["totals"], {"tensor_count": 0, "known_storage_bytes": 0, "unknown_storage_tensors": 0})
 
     def test_mixed_confirmed_layouts_use_raw_shape_and_literal_arithmetic(self):
         # Geometry expectations are deliberate fixture literals, not production

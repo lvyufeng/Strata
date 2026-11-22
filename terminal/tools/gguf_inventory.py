@@ -23,6 +23,11 @@ import gguf_reader as G
 
 MAX_INTEGER = (1 << 63) - 1
 MAX_RECEIPT_BYTES = 64 << 20
+SCHEMA_VERSION = 2
+# v2 raises only the metadata-array-item ceilings, after measuring 744,317
+# declared items in one real shard header, and confirms the six additional GGML
+# types present in that artifact's declared type census. Every other ceiling is
+# unchanged from the reviewed v1 adapter at base revision 3142b66b.
 LIMITS = {
     "max_shards": 64,
     "max_header_bytes_per_file": 16777216,
@@ -32,15 +37,15 @@ LIMITS = {
     "max_metadata_entries_per_file": 4096,
     "max_metadata_entries_total": 8192,
     "max_tensors_total": 100000,
-    "max_array_items_per_file": 500000,
-    "max_array_items_total": 1000000,
+    "max_array_items_per_file": 2000000,
+    "max_array_items_total": 4000000,
     "max_rank": 8,
     "max_glob_entries": 4096,
     "max_path_arguments": 64,
 }
 PRODUCER = {
     "tool": "Strata/terminal/tools/quant_formats.py",
-    "mode": "bounded-local-v1",
+    "mode": "bounded-local-v2",
     "base_revision": "3142b66b96e9c0e775e30f620b11b191a1427c2a",
     "parser_sha256": "c84a0f88c6c75a588cb7de74abd23b2e6387c92c58e088012aedef5bd3c6c431",
 }
@@ -53,9 +58,11 @@ CLAIMS = {
     "device_ready": False,
     "inference_ready": False,
 }
-# An inventory allowlist, not a replacement ggml type/geometry table. In
-# particular, NVFP4 (40), the ambiguous id 41 and other layouts stay unknown.
-CONFIRMED_TYPE_IDS = frozenset((0, 1, 8, 17, 21, 24, 25, 26, 27, 28, 30, 42))
+# An inventory allowlist, not a replacement ggml type/geometry table. The v2 set
+# adds the six ids that the target artifact declares itself: Q6_K 14, IQ2_XXS 16,
+# IQ4_NL 20, IQ2_S 22, IQ4_XS 23 and IQ1_M 29. In particular, IQ1_S 19, MXFP4 39,
+# NVFP4 40, the ambiguous id 41 and other layouts still stay unknown.
+CONFIRMED_TYPE_IDS = frozenset((0, 1, 8, 14, 16, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 42))
 SPLIT_KEYS = ("split.no", "split.count", "split.tensors.count")
 
 
@@ -455,7 +462,7 @@ def inventory(arguments, input_kind: str = "local-unverified") -> dict:
             tensors.append(tensor)
     tensors.sort(key=lambda t: (t["shard"], t["name"]))
     return {
-        "schema_version": 1, "kind": "gguf-header-inventory", "input_kind": input_kind,
+        "schema_version": SCHEMA_VERSION, "kind": "gguf-header-inventory", "input_kind": input_kind,
         "producer": dict(PRODUCER), "limits": dict(LIMITS), "shards": shards, "tensors": tensors,
         "split": _split_receipt(shards, len(tensors)),
         "totals": {"tensor_count": len(tensors), "known_storage_bytes": known_bytes,

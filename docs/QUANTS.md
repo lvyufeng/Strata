@@ -48,7 +48,9 @@ or infer split numbers from filenames. Directories, symlinks, special files, rec
 aliases and duplicate basenames are refused. This mode requires POSIX `O_NOFOLLOW` and `O_NONBLOCK`; systems without
 those protections fail closed. `--hf`, `--json` and `--name` cannot be combined with `--inventory`.
 
-The schema-v1 receipt goes to stdout. To save it, redirect to a separate output file that is not an input GGUF.
+The versioned receipt goes to stdout; this revision emits `schema_version: 2` with producer mode `bounded-local-v2`.
+Receipts from the earlier revision carry `schema_version: 1` and stay valid input for the integration checker, which
+dispatches on the declared version and never coerces one into the other. To save a receipt, redirect to a separate output file that is not an input GGUF.
 The caller's shell can truncate a redirection target before the command runs; the input checks cannot prevent that.
 For files deliberately made by a test, `--inventory-input-kind synthetic` labels the receipt as synthetic. The
 default is `local-unverified`. Either label is a declaration, not verified provenance.
@@ -69,10 +71,12 @@ basenames and timestamps are not emitted. Tensor names remain in the receipt; re
 Tensors are sorted by shard label and name. Shapes keep raw GGUF order: `shape[0]` is the fastest dimension, or
 values per encoded row, not the row/column order used by a CPU matrix kernel.
 
-Known storage is limited to exact type IDs: F32 `0`, F16 `1`, Q8_0 `8`, IQ2_XS `17`, IQ3_S `21`, I8/I16/I32/I64
-`24`/`25`/`26`/`27`, F64 `28`, BF16 `30` and Q2_0 `42`. Their block geometry comes from the existing reader.
+Known storage is limited to exact type IDs: F32 `0`, F16 `1`, Q8_0 `8`, Q6_K `14`, IQ2_XXS `16`, IQ2_XS `17`,
+IQ4_NL `20`, IQ3_S `21`, IQ2_S `22`, IQ4_XS `23`, I8/I16/I32/I64 `24`/`25`/`26`/`27`, F64 `28`, IQ1_M `29`, BF16 `30`
+and Q2_0 `42`. Their block geometry comes from the existing reader.
 The fastest dimension must contain whole blocks. Other layouts keep nullable block, stride and byte fields with
-`layout: "unknown"`; in particular NVFP4 `40` and type `41` are not confirmed by this inventory. A known-storage
+`layout: "unknown"`; in particular IQ1_S `19`, MXFP4 `39`, NVFP4 `40` and type `41` are not confirmed by this
+inventory. A known-storage
 subtotal excludes unknown tensors, metadata, alignment padding, gaps and runtime conversions. It is not a full
 model-size or memory-budget estimate. Aligned offsets, bounded shape products, known extents and interval overlap
 are checked against the same open file's size; unknown sizes are never guessed.
@@ -103,12 +107,14 @@ ceilings below bound requested logical reads and parser work; they are not OS me
 | Each string / string bytes across all files | 1 MiB / 16 MiB |
 | Metadata entries per file / all files | 4,096 / 8,192 |
 | Tensors across all files | 100,000 |
-| Metadata array items per file / all files | 500,000 / 1,000,000 |
+| Metadata array items per file / all files | 2,000,000 / 4,000,000 |
 | Tensor rank | 1–8 |
 | Alignment | Power of two, 8–1,048,576 bytes |
 | Dimensions, shape products, byte arithmetic and file size | At most `(1 << 63) - 1` |
 | Generated JSON receipt | 64 MiB |
 
+Only the metadata-array-item ceilings moved in v2: the reviewed v1 profile used 500,000 / 1,000,000 and refused a
+header-only inspection of one real shard that declared 744,317 items. Every other ceiling above is unchanged from v1.
 Counts and minimum byte requirements are checked before loops and unpack allocations, including the tensor count
 before the first metadata entry. Strings require strict UTF-8; tensor names and metadata keys must be nonempty
 and free of control/format/surrogate characters. Duplicate metadata keys and tensor names, nonfinite floats,
