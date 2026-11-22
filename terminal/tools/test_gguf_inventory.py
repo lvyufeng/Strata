@@ -526,16 +526,20 @@ class LocalInventoryTests(unittest.TestCase):
             self.assertEqual(tensors[kind]["storage"]["data_bytes"], 6 * size)
 
     def test_unknown_and_unverified_layouts_remain_null(self):
-        path, _, _ = self.write_fixture(tensors=[("nvfp4", [64], 40, 0), ("ambiguous", [64], 41, 32),
-                                                ("not-confirmed", [128], 147, 64), ("future", [5, 3], 999, 96)])
+        # The four still-unconfirmed ids stay unknown under the reviewed v1 profile
+        # as well; a v1 receipt must never inherit a v2 geometry by name.
+        path, _, _ = self.write_fixture(tensors=[("iq1-s", [256], 19, 0), ("mxfp4", [32], 39, 32),
+                                                ("nvfp4", [64], 40, 64), ("ambiguous", [64], 41, 96),
+                                                ("not-confirmed", [128], 147, 128), ("future", [5, 3], 999, 160)])
         doc = I.inventory([str(path)])
         names = {t["ggml_type_id"]: t["ggml_type_name"] for t in doc["tensors"]}
-        self.assertEqual(names, {40: "NVFP4", 41: "Q4_0_8_8", 147: "TQP5", 999: "type999"})
+        self.assertEqual(names, {19: "IQ1_S", 39: "MXFP4", 40: "NVFP4", 41: "Q4_0_8_8",
+                                 147: "TQP5", 999: "type999"})
         for tensor in doc["tensors"]:
             self.assertEqual(tensor["storage"], {"layout": "unknown", "block_elements": None,
                              "block_bytes": None, "row_stride_bytes": None, "data_bytes": None})
             self.assertIsNone(tensor["tensor_sha256"])
-        self.assertEqual(doc["totals"], {"tensor_count": 4, "known_storage_bytes": 0, "unknown_storage_tensors": 4})
+        self.assertEqual(doc["totals"], {"tensor_count": 6, "known_storage_bytes": 0, "unknown_storage_tensors": 6})
 
     def test_row_divisibility_does_not_use_flattened_product(self):
         path, _, _ = self.write_fixture(tensors=[("bad-row", [16, 2], 8, 0)])
